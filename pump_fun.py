@@ -157,13 +157,14 @@ async def create_token_transaction(
             "pool":             "pump",
         }
 
-        logger.info(f"Payload pumpportal: {payload}")
+        # /api/trade-local mengharapkan LIST (array), bukan single object
+        logger.info(f"Payload pumpportal: {[payload]}")
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             logger.info("Meminta transaksi dari pumpportal /api/trade-local ...")
             resp = await client.post(
                 PUMPPORTAL_LOCAL,
-                json=payload,
+                json=[payload],   # <-- array!
                 headers={"Content-Type": "application/json"},
             )
 
@@ -175,10 +176,22 @@ async def create_token_transaction(
                 "error": f"pumpportal {resp.status_code}: {resp.text[:500]}",
             }
 
-        # Response: raw bytes serialized VersionedTransaction
-        tx      = VersionedTransaction.from_bytes(resp.content)
+        # Response: JSON array of base58-encoded serialized transactions
+        try:
+            tx_list = resp.json()
+            tx_b58  = tx_list[0]
+        except Exception:
+            # fallback: raw bytes (format lama)
+            tx_list = None
+            tx_b58  = None
 
-        # Sign dengan KEDUA keypair: mint_kp dulu, lalu signer_kp
+        import base58 as _b58
+        if tx_b58:
+            tx_bytes = _b58.b58decode(tx_b58)
+        else:
+            tx_bytes = resp.content
+
+        tx        = VersionedTransaction.from_bytes(tx_bytes)
         signed_tx = VersionedTransaction(tx.message, [mint_kp, signer_kp])
 
         # Kirim ke Solana RPC
