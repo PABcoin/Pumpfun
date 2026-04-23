@@ -138,6 +138,9 @@ async def create_token_transaction(
         signer_kp = _load_keypair()
         mint_kp   = Keypair()   # mint address baru, random setiap pembuatan
 
+        # pumpportal menolak amount=0; pakai minimum 0.0001 jika user pilih tidak beli
+        actual_amount = buy_sol if buy_sol > 0 else 0.0001
+
         payload = {
             "publicKey":        str(signer_kp.pubkey()),
             "action":           "create",
@@ -146,13 +149,15 @@ async def create_token_transaction(
                 "symbol": symbol,
                 "uri":    metadata_uri,
             },
-            "mint":             str(mint_kp.pubkey()),  # public key mint
+            "mint":             str(mint_kp.pubkey()),
             "denominatedInSol": "true",
-            "amount":           buy_sol,
+            "amount":           actual_amount,
             "slippage":         slippage,
             "priorityFee":      priority_fee,
             "pool":             "pump",
         }
+
+        logger.info(f"Payload pumpportal: {payload}")
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             logger.info("Meminta transaksi dari pumpportal /api/trade-local ...")
@@ -162,10 +167,12 @@ async def create_token_transaction(
                 headers={"Content-Type": "application/json"},
             )
 
+        logger.info(f"pumpportal status={resp.status_code} body={resp.text[:500]}")
+
         if resp.status_code != 200:
             return {
                 "success": False,
-                "error": f"pumpportal HTTP {resp.status_code}: {resp.text[:300]}",
+                "error": f"pumpportal {resp.status_code}: {resp.text[:500]}",
             }
 
         # Response: raw bytes serialized VersionedTransaction
