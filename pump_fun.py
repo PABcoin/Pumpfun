@@ -86,23 +86,31 @@ async def upload_metadata_to_ipfs(
         logger.info(f"Image URI: {image_uri}")
 
         # --- Upload metadata JSON ---
-        metadata = {
-            "name":        name,
-            "symbol":      symbol,
+        # Hanya field wajib, tambahkan opsional jika tidak kosong
+        metadata: dict = {
+            "name":      name,
+            "symbol":    symbol,
             "description": description,
-            "image":       image_uri,
-            "twitter":     twitter,
-            "telegram":    telegram,
-            "website":     website,
-            "createdOn":   "https://pump.fun",
+            "image":     image_uri,
+            "createdOn": "https://pump.fun",
         }
+        if website:
+            metadata["website"] = website
+        if twitter:
+            metadata["twitter"] = twitter
+        if telegram:
+            metadata["telegram"] = telegram
+
         logger.info("Uploading metadata JSON ke IPFS...")
         meta_resp = await client.post(
             IPFS_META_URL,
             headers={"Content-Type": "application/json"},
             content=json.dumps(metadata).encode(),
         )
-        meta_resp.raise_for_status()
+        if meta_resp.status_code != 200:
+            raise RuntimeError(
+                f"Metadata upload gagal ({meta_resp.status_code}): {meta_resp.text[:300]}"
+            )
         metadata_uri = meta_resp.text.strip()
         logger.info(f"Metadata URI: {metadata_uri}")
 
