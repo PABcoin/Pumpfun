@@ -92,7 +92,7 @@ async def upload_metadata_to_ipfs(
             "symbol":    symbol,
             "description": description,
             "image":     image_uri,
-            "createdOn": "https://pump.fun",
+            "createdOn": "https://bonk.fun",
         }
         if website:
             metadata["website"] = website
