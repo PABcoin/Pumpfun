@@ -2,16 +2,19 @@
 pump_fun.py — Integrasi dengan pump.fun / pumpportal.fun API
 
 Flow:
-  1. upload_metadata_to_ipfs() — upload gambar + metadata ke IPFS via pump.fun
-  2. create_token_transaction() — buat & sign transaksi Solana via pumpportal.fun
+  1. upload_metadata_to_ipfs() — upload gambar ke Pinata IPFS, lalu upload metadata JSON
+  2. create_token_transaction() — POST ke pumpportal /api/trade-local, sign dg 2 keypair, kirim via RPC
+
+Catatan penting (April 2025):
+  - pump.fun/api/ipfs sudah MATI → harus pakai Pinata atau IPFS lain
+  - Endpoint create BUKAN /api/create → gunakan /api/trade-local
+  - Transaksi harus di-sign oleh DAUA keypair: mint keypair + signer keypair
 """
 
 import os
 import json
 import base64
 import logging
-import asyncio
-from io import BytesIO
 from typing import Optional
 
 import httpx
@@ -20,38 +23,45 @@ from solders.transaction import VersionedTransaction   # type: ignore
 
 logger = logging.getLogger(__name__)
 
-PUMP_IPFS_URL    = "https://pump.fun/api/ipfs"
-PUMPPORTAL_URL   = "https://pumpportal.fun/api/create"
+# Endpoint yang benar (per dokumentasi pumpportal April 2025)
+PINATA_UPLOAD_URL  = "https://uploads.pinata.cloud/v3/files"
+PINATA_GATEWAY     = "https://ipfs.io/ipfs"
+PUMPPORTAL_LOCAL   = "https://pumpportal.fun/api/trade-local"
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _load_keypair() -> Keypair:
-    """Muat Solana keypair dari environment variable."""
-    raw = os.environ.get("WALLET_PRIVATE_KEY", "")
+    """Muat Solana keypair dari environment variable WALLET_PRIVATE_KEY."""
+    raw = os.environ.get("WALLET_PRIVATE_KEY", "").strip()
     if not raw:
         raise ValueError(
-            "WALLET_PRIVATE_KEY belum di-set. "
-            "Isi dengan private key wallet Solana kamu (base58 atau JSON array)."
+            "WALLET_PRIVATE_KEY belum di-set di Railway Variables!\n"
+            "Isi dengan private key wallet Solana (format base58 atau JSON array)."
         )
-
-    raw = raw.strip()
-
-    # Format JSON array: [12, 34, ...]
     if raw.startswith("["):
         try:
-            secret = bytes(json.loads(raw))
-            return Keypair.from_bytes(secret)
+            return Keypair.from_bytes(bytes(json.loads(raw)))
         except Exception as e:
-            raise ValueError(f"WALLET_PRIVATE_KEY format JSON array tidak valid: {e}")
-
-    # Format base58
+            raise ValueError(f"WALLET_PRIVATE_KEY JSON array tidak valid: {e}")
     try:
         return Keypair.from_base58_string(raw)
     except Exception as e:
-        raise ValueError(f"WALLET_PRIVATE_KEY format base58 tidak valid: {e}")
+        raise ValueError(f"WALLET_PRIVATE_KEY base58 tidak valid: {e}")
 
 
-# ── Step 1: Upload ke IPFS ────────────────────────────────────────────────────
+def _pinata_jwt() -> str:
+    """Ambil Pinata JWT dari environment."""
+    jwt = os.environ.get("PINATA_JWT", "").strip()
+    if not jwt:
+        raise ValueError(
+            "PINATA_JWT belum di-set di Railway Variables!\n"
+            "Daftar gratis di https://pinata.cloud → API Keys → buat JWT."
+        )
+    return jwt
+
+
+# ── Step 1: Upload gambar + metadata ke Pinata IPFS ──────────────────────────
 
 async def upload_metadata_to_ipfs(
     name: str,
@@ -61,107 +71,132 @@ async def upload_metadata_to_ipfs(
     telegram: str,
     website: str,
     image_bytes: bytes,
-    image_name: str = "logo.jpg",
-    timeout: int = 60,
+    image_name: str = "logo.png",
+    timeout: int = 90,
 ) -> str:
     """
-    Upload gambar + metadata ke IPFS pump.fun.
-    Return: metadata URI (string)
+    1. Upload gambar ke Pinata → dapat CID gambar
+    2. Upload JSON metadata ke Pinata → dapat CID metadata
+    Return: metadata URI  (https://ipfs.io/ipfs/<cid>)
     """
-    mime = "image/gif" if image_name.lower().endswith(".gif") else "image/jpeg"
-    if image_name.lower().endswith(".png"):
-        mime = "image/png"
+    jwt = _pinata_jwt()
+    headers = {"Authorization": f"Bearer {jwt}"}
 
-    form_data = {
-        "name":        (None, name),
-        "symbol":      (None, symbol),
-        "description": (None, description),
-        "twitter":     (None, twitter),
-        "telegram":    (None, telegram),
-        "website":     (None, website),
-        "showName":    (None, "true"),
-        "file":        (image_name, image_bytes, mime),
-    }
+    mime = "image/png"
+    if image_name.lower().endswith(".jpg") or image_name.lower().endswith(".jpeg"):
+        mime = "image/jpeg"
+    elif image_name.lower().endswith(".gif"):
+        mime = "image/gif"
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            PUMP_IPFS_URL,
-            files=form_data,
+        # --- Upload gambar ---
+        logger.info("Uploading gambar ke Pinata...")
+        img_resp = await client.post(
+            PINATA_UPLOAD_URL,
+            headers=headers,
+            files={
+                "network": (None, "public"),
+                "file":    (image_name, image_bytes, mime),
+            },
         )
-        response.raise_for_status()
-        result = response.json()
+        img_resp.raise_for_status()
+        img_cid = img_resp.json()["data"]["cid"]
+        image_url = f"{PINATA_GATEWAY}/{img_cid}"
+        logger.info(f"Gambar CID: {img_cid}")
 
-    metadata_uri = result.get("metadataUri") or result.get("uri") or result.get("url")
-    if not metadata_uri:
-        raise RuntimeError(f"IPFS upload gagal, response: {result}")
+        # --- Upload metadata JSON ---
+        metadata = {
+            "name":        name,
+            "symbol":      symbol,
+            "description": description,
+            "image":       image_url,
+            "twitter":     twitter,
+            "telegram":    telegram,
+            "website":     website,
+            "createdOn":   "https://pump.fun",
+        }
+        meta_bytes = json.dumps(metadata).encode()
+        meta_file  = ("metadata.json", meta_bytes, "application/json")
 
-    logger.info(f"IPFS upload sukses: {metadata_uri}")
+        logger.info("Uploading metadata JSON ke Pinata...")
+        meta_resp = await client.post(
+            PINATA_UPLOAD_URL,
+            headers=headers,
+            files={
+                "network": (None, "public"),
+                "file":    meta_file,
+            },
+        )
+        meta_resp.raise_for_status()
+        meta_cid = meta_resp.json()["data"]["cid"]
+        metadata_uri = f"{PINATA_GATEWAY}/{meta_cid}"
+        logger.info(f"Metadata URI: {metadata_uri}")
+
     return metadata_uri
 
 
-# ── Step 2: Buat Token di Solana ──────────────────────────────────────────────
+# ── Step 2: Buat, sign, dan kirim transaksi token ────────────────────────────
 
 async def create_token_transaction(
+    name: str,
+    symbol: str,
     metadata_uri: str,
     buy_sol: float = 0.0,
-    slippage_bps: int = 2500,
-    priority_fee: float = 0.0005,
+    slippage: int = 15,
+    priority_fee: float = 0.00005,
     timeout: int = 60,
 ) -> dict:
     """
-    Buat, sign, dan kirim transaksi pembuatan token ke Solana via pumpportal.fun.
-    Return: dict dengan key 'success', 'mint', 'signature', atau 'error'.
+    POST ke pumpportal /api/trade-local → dapat serialized VersionedTransaction
+    Sign dengan [mint_keypair, signer_keypair]
+    Kirim ke Solana via RPC
+    Return: {"success": bool, "mint": str, "signature": str} atau {"success": False, "error": str}
     """
     try:
-        keypair    = _load_keypair()
-        mint_kp    = Keypair()  # Keypair baru untuk mint address token
+        signer_kp = _load_keypair()
+        mint_kp   = Keypair()          # mint address baru, random setiap pembuatan
 
         payload = {
-            "publicKey":        str(keypair.pubkey()),
+            "publicKey":        str(signer_kp.pubkey()),
             "action":           "create",
             "tokenMetadata": {
-                "name":   "token",   # akan di-override dari metadata_uri
-                "symbol": "TOKEN",   # akan di-override dari metadata_uri
+                "name":   name,
+                "symbol": symbol,
                 "uri":    metadata_uri,
             },
-            "mint":             str(mint_kp.pubkey()),
+            "mint":             str(mint_kp.pubkey()),  # public key, bukan secret!
             "denominatedInSol": "true",
             "amount":           buy_sol,
-            "slippage":         slippage_bps,
+            "slippage":         slippage,
             "priorityFee":      priority_fee,
             "pool":             "pump",
         }
 
         async with httpx.AsyncClient(timeout=timeout) as client:
-            # Minta transaksi dari pumpportal
+            logger.info("Meminta transaksi dari pumpportal /api/trade-local ...")
             resp = await client.post(
-                PUMPPORTAL_URL,
+                PUMPPORTAL_LOCAL,
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
-            resp.raise_for_status()
 
-            if resp.headers.get("content-type", "").startswith("application/json"):
-                data = resp.json()
-                # Kalau sudah langsung berhasil (beberapa endpoint mengembalikan ini)
-                if data.get("signature"):
-                    return {
-                        "success":   True,
-                        "mint":      str(mint_kp.pubkey()),
-                        "signature": data["signature"],
-                    }
-                raise RuntimeError(f"Response tidak dikenali: {data}")
+        if resp.status_code != 200:
+            return {
+                "success": False,
+                "error": f"pumpportal HTTP {resp.status_code}: {resp.text[:300]}",
+            }
 
-            # Pumpportal mengembalikan transaksi dalam binary untuk kita sign
-            tx_bytes = resp.content
+        # Response: raw bytes serialized VersionedTransaction
+        tx_bytes = resp.content
+        tx       = VersionedTransaction.from_bytes(tx_bytes)
 
-        # Sign & kirim ke Solana RPC
-        rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+        # Sign dengan KEDUA keypair: mint_kp + signer_kp
+        signed_tx = VersionedTransaction(tx.message, [mint_kp, signer_kp])
 
-        tx      = VersionedTransaction.from_bytes(tx_bytes)
-        signed  = keypair.sign_message(bytes(tx.message))
+        # Kirim ke Solana RPC
+        rpc_url   = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+        tx_b64    = base64.b64encode(bytes(signed_tx)).decode()
 
-        # Solana sendTransaction via JSON-RPC
         async with httpx.AsyncClient(timeout=timeout) as client:
             rpc_resp = await client.post(
                 rpc_url,
@@ -169,10 +204,7 @@ async def create_token_transaction(
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "sendTransaction",
-                    "params": [
-                        base64.b64encode(bytes(tx)).decode(),
-                        {"encoding": "base64", "skipPreflight": True},
-                    ],
+                    "params": [tx_b64, {"encoding": "base64", "skipPreflight": True}],
                 },
             )
             rpc_data = rpc_resp.json()
@@ -181,17 +213,14 @@ async def create_token_transaction(
             return {"success": False, "error": str(rpc_data["error"])}
 
         signature = rpc_data.get("result", "")
-        logger.info(f"Token berhasil dibuat! Mint={mint_kp.pubkey()} Sig={signature}")
+        mint_addr = str(mint_kp.pubkey())
+        logger.info(f"✅ Token dibuat! Mint={mint_addr} Sig={signature}")
 
-        return {
-            "success":   True,
-            "mint":      str(mint_kp.pubkey()),
-            "signature": signature,
-        }
+        return {"success": True, "mint": mint_addr, "signature": signature}
 
     except httpx.HTTPStatusError as e:
-        logger.exception("HTTP error saat create token")
-        return {"success": False, "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}"}
+        logger.exception("HTTP error")
+        return {"success": False, "error": f"HTTP {e.response.status_code}: {e.response.text[:300]}"}
     except Exception as e:
-        logger.exception("Error tak terduga saat create token")
+        logger.exception("Error tidak terduga")
         return {"success": False, "error": str(e)}

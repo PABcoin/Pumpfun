@@ -273,6 +273,8 @@ async def confirm_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         # 2. Buat dan kirim transaksi ke Solana
         await query.message.reply_text("⛓ Membuat transaksi di Solana...")
         result = await create_token_transaction(
+            name=data["name"],
+            symbol=data["ticker"],
             metadata_uri=metadata_uri,
             buy_sol=data.get("buy_amount", 0),
         )
